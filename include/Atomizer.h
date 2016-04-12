@@ -65,15 +65,7 @@ typedef enum {
 	/**
 	 * Atomizer not present or large resistance.
 	 */
-	OPEN,
-	/**
-	 * Weak battery.
-	 */
-	WEAK_BATT,
-	/**
-	 * Board is too hot.
-	 */
-	OVER_TEMP
+	OPEN
 } Atomizer_Error_t;
 
 /**
