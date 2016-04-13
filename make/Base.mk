@@ -14,12 +14,18 @@
 # change EVICSDK when building include and linker paths.
 # OBJS paths are Cygwin-style.
 
+ifeq ($(MODTYPE),)
+	MODTYPE := default
+#  OBJS := main.o
+#  TARGET := default
+endif
+
 NUVOSDK = $(EVICSDK)/nuvoton-sdk/Library
 
 # Force OBJS immediate expansion, since we'll be
 # changing EVICSDK later.
 OBJS := $(OBJS)
-
+TARGET := $(MODTYPE)_$(TARGET)
 CPU := cortex-m4
 
 ifeq ($(shell $(CC) -v 2>&1 | grep -c "clang version"), 1)
@@ -65,13 +71,14 @@ BINDIR := bin
 INCDIRS := -I$(NUVOSDK)/CMSIS/Include \
 	-I$(NUVOSDK)/Device/Nuvoton/M451Series/Include \
 	-I$(NUVOSDK)/StdDriver/inc \
-	-I$(EVICSDK)/include
+	-I$(EVICSDK)/include \
+	-I$(EVICSDK)/$(MODTYPE)/include
 
-LDSCRIPT := $(EVICSDK)/linker/linker.ld
+LDSCRIPT := $(EVICSDK)/linker/$(MODTYPE)_linker.ld
 
 LIBDIRS := -L$(ARMGCC)/arm-none-eabi/lib \
-	-L$(ARMGCC)/lib/arm-none-eabi/newlib \
-	-L$(ARMGCC)/lib/gcc/arm-none-eabi/$(shell arm-none-eabi-gcc -dumpversion) \
+	-L$(ARMGCC)/arm-none-eabi/newlib \
+	-L$(ARMGCC)/gcc/arm-none-eabi/$(shell arm-none-eabi-gcc -dumpversion) \
 	-L$(EVICSDK)/lib
 
 CFLAGS += -Wall -mcpu=$(CPU) -mthumb -Os -fdata-sections -ffunction-sections

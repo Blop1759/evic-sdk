@@ -26,9 +26,23 @@ extern "C" {
 #endif
 
 /**
- * Maximum output voltage, in millivolts.
+ * Type for storing converters state.
  */
-#define ATOMIZER_MAX_VOLTS 9000
+typedef enum {
+	/**
+	 * Converters are powered off.
+	 */
+	POWEROFF,
+	/**
+	 * Buck converter is active.
+	 */
+	POWERON_BUCK,
+	/**
+	 * Boost converter is active.
+	 */
+	POWERON_BOOST
+} Atomizer_ConverterState_t;
+
 
 /**
  * Structure to hold atomizer info.
@@ -48,6 +62,15 @@ typedef struct {
 	 * Output current in mA, measured at the atomizer.
 	 */
 	uint16_t current;
+  /** 
+   *  State of dc/dc converter for debug purpose
+   */  
+  Atomizer_ConverterState_t state;
+	/**
+	 * Atomizer "live" resistance, in mOhm.
+	 *
+	 */
+	uint16_t tcRes;  
 } Atomizer_Info_t;
 
 /**
@@ -65,16 +88,10 @@ typedef enum {
 	/**
 	 * Atomizer not present or large resistance.
 	 */
-	OPEN,
-	/**
-	 * Weak battery.
-	 */
-	WEAK_BATT,
-	/**
-	 * Board is too hot.
-	 */
-	OVER_TEMP
+	OPEN
 } Atomizer_Error_t;
+
+uint16_t wattsToVolts(uint32_t watts, uint16_t res);
 
 /**
  * Initializes the atomizer library.

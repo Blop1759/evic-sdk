@@ -27,6 +27,7 @@
 #include <Button.h>
 #include <TimerUtils.h>
 #include <Battery.h>
+#include <Globals.h>
 
 uint16_t wattsToVolts(uint32_t watts, uint16_t res) {
 	// Units: mV, mW, mOhm
@@ -135,12 +136,6 @@ int main() {
 				break;
 			case OPEN:
 				atomState = "NO ATOM";
-				break;
-			case WEAK_BATT:
-				atomState = "WEAK BAT";
-				break;
-			case OVER_TEMP:
-				atomState = "TOO HOT";
 				break;
 			default:
 				atomState = Atomizer_IsOn() ? "FIRING" : "";

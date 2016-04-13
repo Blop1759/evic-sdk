@@ -1,4 +1,4 @@
-TARGET := timer
+TARGET := Blop
 OBJS := main.o
 export TARGET
 export OBJS
