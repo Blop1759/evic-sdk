@@ -24,6 +24,7 @@
 #include <TimerUtils.h>
 #include <Dataflash.h>
 #include <Globals.h>
+#include <Battery.h>
 
 /**
  * \file
@@ -70,6 +71,21 @@
 // To get 1ohm accuracy and save a multiplication, ADC_VREF and ADC_DENOMINATOR are hardcoded.
 // Maximum result size: 17 bits.
 #define ATOMIZER_ADC_THERMRES(x) (20000L * (x) / (5280L - (x)))
+// Battery is weak when < 2.8V under load, i.e. ADC value < 2240.
+#define ATOMIZER_ADC_WEAKBATT(x) ((x) < 2240)
+// Board temperature limit is 70°C.
+// Simplified from: ATOMIZER_ADC_THERMRES(x) <= Atomizer_boardTempTable[14]
+#define ATOMIZER_ADC_OVERTEMP(x) (41L * (x) <= 16480L)
+// Board temperature limit for actualizing tc res is 25°C(+5°C vs TC coil temp ref)
+// Simplified from: ATOMIZER_ADC_THERMRES(x) <= Atomizer_boardTempTable[5]
+#define ATOMIZER_ADC_TCTEMP(x) (41L * (x) <= 100000L)
+// This assumes a battery internal resistance of 10mOhm (which is pretty low).
+// It takes the target output voltage in 10mV units, the atomizer resistance in mOhm and
+// the battery voltage in mV. The battery is weak if it's under 3.1V, or if it's expected
+// to sag below 2.8V under load (only checked if res != 0).
+#define ATOMIZER_PREDICT_WEAKBATT(targetVolts, res, battVolts) ((battVolts) < 3100 || \
+	((res) != 0 && (battVolts) - (targetVolts) * 10L / (res) < 2800))
+
 
 // Timer flags
 #define ATOMIZER_TMRFLAG_WARMUP (1 << 0)
@@ -166,6 +182,10 @@ static volatile uint16_t Atomizer_timerCountRefresh;
 static volatile uint8_t Atomizer_timerFlag;
 
 /**
+ * Just a flag to know if board temp is higher than minimum ref temp for TC
+ */ 
+static volatile uint8_t Board_above_TC_temp;
+/**
  * Thermistor resistance to board temperature lookup table.
  * boardTempTable[i] maps the 5°C range starting at 5*i °C.
  * Linear interpolation is done inside the range.
@@ -176,13 +196,6 @@ static const uint16_t Atomizer_boardTempTable[21] = {
 	 1648,  1388,  1175,   999,   853,   732,  630
 };
 
-uint16_t wattsToVolts(uint32_t watts, uint16_t res) {
-	// Units: mV, mW, mOhm
-	// V = sqrt(P * R)
-	// Round to nearest multiple of 10
-	uint16_t volts = (sqrt(watts * res) + 5) / 10;
-	return volts * 10;
-}
 
 /**
  * Configures a PWM channel.
@@ -260,7 +273,7 @@ static void Atomizer_ConfigureConverters(uint8_t enableBuck, uint8_t enableBoost
  * This is an internal function.
  */
 static void Atomizer_NegativeFeedback(uint32_t unused) {
-	uint16_t adcVoltage, adcCurrent, curVolts;
+	uint16_t adcVoltage, adcCurrent, adcBattery, adcBoardTemp, curVolts;
 	uint32_t resistance;
 	Atomizer_ConverterState_t nextState;
 
@@ -268,7 +281,10 @@ static void Atomizer_NegativeFeedback(uint32_t unused) {
 	// This loop always runs (until this point), even when
 	// the atomizer is not powered on. Let's exploit it to
 	// keep good values in the cache for when we power it up.
-	ADC_UpdateCache((uint8_t []) {ADC_MODULE_VATM, ADC_MODULE_CURS}, 2, 0);
+	ADC_UpdateCache((uint8_t []) {
+		ADC_MODULE_VATM, ADC_MODULE_CURS,
+		ADC_MODULE_VBAT, ADC_MODULE_TEMP
+	}, 4, 0);
 
 	if(Atomizer_timerCountRefresh != 5000) {
 		Atomizer_timerCountRefresh++;
@@ -291,9 +307,17 @@ static void Atomizer_NegativeFeedback(uint32_t unused) {
 	// Get ADC readings
 	adcVoltage = ADC_GetCachedResult(ADC_MODULE_VATM);
 	adcCurrent = ADC_GetCachedResult(ADC_MODULE_CURS);
+	adcBattery = ADC_GetCachedResult(ADC_MODULE_VBAT);
+	adcBoardTemp = ADC_GetCachedResult(ADC_MODULE_TEMP);
 
 	Atomizer_error = OK;
-	if(Atomizer_timerCountWarmup > 25) {
+	if(ATOMIZER_ADC_OVERTEMP(adcBoardTemp)) {
+		Atomizer_error = OVER_TEMP;
+	}
+	else if(ATOMIZER_ADC_WEAKBATT(adcBattery)) {
+		Atomizer_error = WEAK_BATT;
+	}
+	else if(Atomizer_timerCountWarmup > 25) {
 		// Start checking resistance after 1ms
 		resistance = ATOMIZER_ADC_RESISTANCE(adcVoltage, adcCurrent);
 		if(resistance >= 5 && resistance < 40) {
@@ -302,10 +326,23 @@ static void Atomizer_NegativeFeedback(uint32_t unused) {
 		else if(resistance > 50000) {
 			Atomizer_error = OPEN;
 		}
+    Board_above_TC_temp = ATOMIZER_ADC_TCTEMP(adcBoardTemp);
+  	//Test for TC coils : keep an alive res
+    if (Atomizer_error != OPEN && Atomizer_error != SHORT) {
+      Atomizer_tempTCRes = resistance;
+      //if (Atomizer_baseRes > resistance && Board_above_TC_temp) {
+        //Atomizer_baseRes = resistance;//tempRes should descrease while poweroff except if board is less than 25°
+      //}
+    }
 	}
+  
+  
+  
 	if(Atomizer_error != OK) {
-		Atomizer_baseRes = 0;
-		Atomizer_tempRes = 0;
+		if (Atomizer_error == OPEN || Atomizer_error == SHORT) {
+      Atomizer_baseRes = 0;
+    }
+ 		Atomizer_tempRes = 0;
 		Atomizer_Control(0);
 		return;
 	}
@@ -359,10 +396,12 @@ static void Atomizer_NegativeFeedback(uint32_t unused) {
 	}
 
 	// Set new duty cycle
-	PWM_SET_CMR(PWM0, Atomizer_curState == POWERON_BUCK ? ATOMIZER_PWMCH_BUCK : ATOMIZER_PWMCH_BOOST, Atomizer_curCmr);
+	// nextState is used here because:
+	// If state didn't change, it'll be == Atomizer_curState
+	// If state changed, duty cycle on the new channel must be set before reconfiguration
+	PWM_SET_CMR(PWM0, nextState == POWERON_BUCK ? ATOMIZER_PWMCH_BUCK : ATOMIZER_PWMCH_BOOST, Atomizer_curCmr);
 
 	// If needed, update state and reconfigure converters
-	// Ensures duty cycle is set before reconfiguration
 	if(nextState != Atomizer_curState) {
 		Atomizer_curState = nextState;
 		Atomizer_ConfigureConverters(nextState == POWERON_BUCK, nextState == POWERON_BOOST);
@@ -398,7 +437,7 @@ void Atomizer_Init() {
   			break;
   	}
   } else if (MODTYPE == PRESATC75W) {
-    Atomizer_shuntRes = 100;//in OFW, no differences between hardware
+    Atomizer_shuntRes = 100;//in OFW, no differences between hardwares
   } else {
     //by default, setting 115 as for Evic
     Atomizer_shuntRes = 115;
@@ -449,6 +488,7 @@ void Atomizer_SetOutputVoltage(uint16_t volts) {
 }
 
 void Atomizer_Control(uint8_t powerOn) {
+	uint16_t battVolts;
 	if(Atomizer_error == SHORT) {
 		// Lock atomizer after short
 		return;
@@ -460,6 +500,12 @@ void Atomizer_Control(uint8_t powerOn) {
 	}
 
 	if(powerOn) {
+		// Don't even bother firing if the battery is weak
+		battVolts = Battery_GetVoltage();
+		if(ATOMIZER_PREDICT_WEAKBATT(Atomizer_targetVolts, Atomizer_baseRes, battVolts)) {
+			Atomizer_error = WEAK_BATT;
+			return;
+		}
 		// Start from buck with duty cycle 10
 		Atomizer_error = OK;
 		Atomizer_curCmr = 10;
@@ -479,8 +525,8 @@ uint8_t Atomizer_IsOn() {
 }
 
 Atomizer_Error_t Atomizer_GetError() {
-	// Mask OK code while resistance is stabilizing
-	return Atomizer_error == OK && Atomizer_tempRes != 0 ? OPEN : Atomizer_error;
+	// Mask OK code while resistance is stabilizing if beyond 3.5ohm  (for test purpose, with tc coils, stabilizing could take time and we could want to fire)
+	return Atomizer_error == OK && Atomizer_tempRes != 0 && Atomizer_tempRes > 3500 ? OPEN : Atomizer_error;
 }
 
 /**
@@ -505,7 +551,11 @@ static void Atomizer_Sample(uint16_t targetVolts, uint16_t *voltage, uint16_t *c
 		savedTargetVolts = Atomizer_targetVolts;
 		Atomizer_SetOutputVoltage(targetVolts);
 		Atomizer_Control(1);
-		ATOMIZER_WAIT_WARMUP();
+    //test to see if while temp is stabilizing, 
+    //warmup is not causing bad values on TC coils
+    //if (Atomizer_tempRes == 0) {
+		  ATOMIZER_WAIT_WARMUP();
+    //}
 
 		if(Atomizer_error == OK) {
 			// Sample and average V and I
@@ -549,6 +599,11 @@ static void Atomizer_Sample(uint16_t targetVolts, uint16_t *voltage, uint16_t *c
 	}
 	else {
 		*resistance = adcRes;
+		// Since TCR is always positive, adcRes < baseRes
+		// implies a better resistance reading has been acquired.
+		if(adcRes >= 5 && adcRes < Atomizer_baseRes) {
+			Atomizer_baseRes = adcRes;
+		}
 		return;
 	}
 
@@ -581,14 +636,11 @@ static void Atomizer_Refresh() {
 		Atomizer_Control(0);
 		Atomizer_SetOutputVoltage(targetVolts);
 
-		//Test for TC coils : always save last stabilized baseRes
-		if(Atomizer_baseRes != 0 || Atomizer_error != OK) {//Atomizer_baseRes != 0 || 
-      Atomizer_Sample(Atomizer_tempTCRes == 0 ? 100 : (Atomizer_tempTCRes * 49L / 30L + 744L) / 10L, &voltage, &current, &resistance);
-      if(Atomizer_error != OK) {
-	     	return;
-	    }
-      Atomizer_tempTCRes = resistance;
-			return;
+		if(Atomizer_baseRes != 0 || Atomizer_error != OK) { 
+        if (Atomizer_error == OPEN || Atomizer_error == SHORT) {
+    		  Atomizer_tempTCRes = 0;
+        }
+  			return;
 		}
 	}
 
@@ -608,10 +660,10 @@ static void Atomizer_Refresh() {
 	// This is needed because resistance fluctuates while screwing
 	// in the 510 connector.
 	if(Atomizer_tempRes == 0 || ATOMIZER_DIFF_NOT_BOUND(resistance, Atomizer_tempRes, 5)) {
-		Atomizer_tempRes = resistance;
-    if (Atomizer_tempTCRes > resistance) {
-      Atomizer_tempTCRes = resistance;//tempRes should descrease while poweroff
-    }
+      Atomizer_tempRes = resistance;
+      if (Atomizer_tempTCRes > resistance && Board_above_TC_temp && resistance > 5 && resistance < 3500) {
+        Atomizer_tempTCRes = resistance;//tempRes should descrease while poweroff except if board is less than 25°
+      }
 	}
 	else {
 		Atomizer_tempRes = 0;
